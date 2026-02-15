@@ -10,7 +10,7 @@ Coulomb law: V_i(r) = -Z_i / |r - r_i| (atomic units).
 """
 import json # file to store the nuclei positions
 import os # operating system (file explorer)
-import numpy as np 
+import numpy as np
 from periodic_data import ELEMENTS_1_118
 
 # Path to shared state file
