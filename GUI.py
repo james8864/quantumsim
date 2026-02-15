@@ -1,18 +1,16 @@
 """
-Chatbot PubChem — Extraction de géométries moléculaires 3D + Schrödinger SCF.
+PubChem Chatbot — 3D molecular geometry extraction + Schrödinger cloud.
 
-L'utilisateur entre une commande contenant le nom d'une molécule.
-Le chatbot interroge PubChem PUG-REST, affiche la géométrie 3-D,
-puis permet de lancer le solveur Schrödinger pour calculer les niveaux
-d'énergie et afficher le nuage électronique (probabilité) par points.
+Enter a molecule name. The chatbot queries PubChem PUG-REST, displays
+3D geometry, then lets you run the Schrödinger solver for electron density
+visualization (potential V(r) and probability heatmaps).
 
-Barre d'outils en haut : électrons, calcul SCF, sélection du niveau,
-mode d'affichage.  Zoom à la molette.
+Toolbar: Potential V(r) slices, Schrödinger Cloud (50x50x50), zoom with scroll.
 
-Utilisation :
-    python pubchem_chatbot.py
+Usage: python pubchem_chatbot.py
 """
 
+import math
 import re
 import threading
 import tkinter as tk
@@ -34,10 +32,9 @@ from potential_3d import (
     potential_3d as build_potential_func,   # V(x,y,z) callable builder
     potential_on_grid,                      # evaluate V on a 3D meshgrid
 )
-from schrodinger_3d import (
-    solve_schrodinger,
-    sample_positions_from_probability,
-    get_esp_at_points,
+from schrodinger import (
+    compute_schrodinger_cloud,
+    open_schrodinger_cloud_window,
 )
 
 # ─────────────────────────  Constantes  ─────────────────────
@@ -45,7 +42,7 @@ ANGSTROM_TO_BOHR = 1.8897259886          # 1 Å = 1.889… a₀
 PUBCHEM_3D_URL   = ("https://pubchem.ncbi.nlm.nih.gov/rest/pug/"
                      "compound/name/{name}/JSON?record_type=3d")
 
-# Couleurs CPK par élément
+# CPK colors per element
 _ELEMENT_COLORS = {
     "H": "#FFFFFF", "He": "#D9FFFF", "Li": "#CC80FF", "Be": "#C2FF00",
     "B": "#FFB5B5", "C": "#909090", "N": "#3050F8", "O": "#FF0D0D",
@@ -62,9 +59,9 @@ _DEFAULT_COLOR = "#FF69B4"
 
 def fetch_pubchem_3d(molecule_name: str) -> dict:
     """
-    Interroge PubChem pour la géométrie 3D d'une molécule.
+    Query PubChem for 3D geometry of a molecule.
 
-    Retourne un dict :
+    Returns a dict:
         cid, name, atoms [(sym,(x,y,z))], elements [sym], bonds [(i,j,order)],
         total_electrons (neutral molecule)
     """
@@ -73,17 +70,17 @@ def fetch_pubchem_3d(molecule_name: str) -> dict:
 
     if resp.status_code == 404:
         raise ValueError(
-            f"Molécule « {molecule_name} » introuvable sur PubChem.\n"
-            "Essayez un autre nom (anglais recommandé) ou une formule brute.")
+            f"Molecule \"{molecule_name}\" not found on PubChem.\n"
+            "Try another name (English recommended) or a chemical formula.")
     if resp.status_code != 200:
         raise ConnectionError(
-            f"PubChem a répondu avec le code {resp.status_code}.\n"
-            "Vérifiez votre connexion Internet et réessayez.")
+            f"PubChem responded with code {resp.status_code}.\n"
+            "Check your internet connection and try again.")
 
     data = resp.json()
     compounds = data.get("PC_Compounds", [])
     if not compounds:
-        raise ValueError(f"Aucun composé retourné pour « {molecule_name} ».")
+        raise ValueError(f"No compound returned for \"{molecule_name}\".")
 
     comp = compounds[0]
     cid = comp.get("id", {}).get("id", {}).get("cid", 0)
@@ -96,7 +93,7 @@ def fetch_pubchem_3d(molecule_name: str) -> dict:
     conformers     = coords_section.get("conformers", [])
     if not conformers:
         raise ValueError(
-            f"Pas de conformère 3D pour « {molecule_name} » (CID {cid}).")
+            f"No 3D conformer for \"{molecule_name}\" (CID {cid}).")
     conf = conformers[0]
     xs_ang = conf.get("x", [])
     ys_ang = conf.get("y", [])
@@ -160,15 +157,12 @@ def _extract_molecule_name(user_input: str) -> str:
 
 
 # ─────────────────────────  Toolbar labels  ─────────────────
-_VIEW_NUCLEI   = "Noyaux uniquement"
-_VIEW_DENSITY  = "Densité électronique"
-_VIEW_ESP      = "Carte potentiel (ESP)"
 
 
 # ─────────────────────────  Interface  ──────────────────────
 
 class PubChemChatbot:
-    """Fenêtre Tkinter : barre d'outils + graphique 3D + chat."""
+    """Tkinter window: toolbar + 3D plot + chat."""
 
     # Catppuccin Mocha
     _BG        = "#1e1e2e"
@@ -188,18 +182,9 @@ class PubChemChatbot:
         self.root.minsize(960, 580)
         self.root.configure(bg=self._BG)
 
-        self._current_mol = None       # dernier résultat PubChem
+        self._current_mol = None       # last PubChem result
         self._display_bohr = True
         self._zoom = 10.0              # matplotlib 3D "dist" for zoom
-        self._computing = False        # SCF running flag
-
-        # Schrödinger state
-        self._scf_energies = []
-        self._scf_wavefunctions = []
-        self._scf_grid_info = {}
-        self._scf_occupancies = []
-        self._scf_density = None
-        self._scf_esp = None
         self._colorbar = None
 
         # ── layout : top toolbar | left plot | right chat ──
@@ -219,19 +204,14 @@ class PubChemChatbot:
 
         # Welcome message
         self._bot_say(
-            "Bienvenue ! Je suis le chatbot PubChem + Schrödinger.\n"
-            "Tapez le nom d'une molécule et j'afficherai sa géométrie 3D.\n\n"
-            "Exemples :\n"
+            "Welcome! I'm the PubChem + Schrödinger chatbot.\n"
+            "Type a molecule name and I'll display its 3D geometry.\n\n"
+            "Examples:\n"
             "  • water  •  methane  •  aspirin  •  caffeine\n"
-            "  • show me benzene  •  cherche ethanol\n\n"
-            "Barre d'outils (en haut) :\n"
-            "  1. Le nombre d'électrons est rempli automatiquement\n"
-            "  2. « Calculer SCF » lance le solveur Schrödinger\n"
-            "  3. Sélectionnez un niveau d'énergie dans le menu\n"
-            "  4. Zoomez avec la molette de la souris\n\n"
-            "Commandes spéciales :\n"
-            "  • bohr / angstrom — unité d'affichage\n"
-            "  • aide / help — ce message"
+            "  • show me benzene  •  ethanol\n\n"
+            "Toolbar: Potential V(r) slices, Schrödinger Cloud (electron density).\n"
+            "Zoom with mouse wheel.\n\n"
+            "Commands: bohr / angstrom  •  info  •  clear  •  help"
         )
 
         self.root.mainloop()
@@ -241,59 +221,33 @@ class PubChemChatbot:
         tb = tk.Frame(self.root, bg=self._TB_BG, height=42)
         tb.pack(fill="x", padx=6, pady=(6, 0))
 
-        # ── Électrons ──
-        tk.Label(tb, text="Électrons :", bg=self._TB_BG, fg=self._FG,
-                 font=("Segoe UI", 9)).pack(side="left", padx=(8, 2))
-        self._electrons_var = tk.StringVar(value="0")
-        self._electrons_entry = tk.Entry(
-            tb, textvariable=self._electrons_var, width=5,
-            bg=self._ENTRY_BG, fg=self._ENTRY_FG,
-            insertbackground=self._ENTRY_FG,
-            font=("Consolas", 10), relief="flat", bd=0)
-        self._electrons_entry.pack(side="left", padx=(0, 8), ipady=2)
-
-        # ── Calculer SCF ──
-        self._compute_btn = tk.Button(
-            tb, text="Calculer SCF", bg=self._ACCENT, fg="#1e1e2e",
-            activebackground="#74c7ec", font=("Segoe UI", 9, "bold"),
-            relief="flat", cursor="hand2", command=self._on_compute_scf)
-        self._compute_btn.pack(side="left", padx=(0, 12), ipady=2, ipadx=6)
-
-        # ── separator ──
-        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y",
-                                                  padx=4, pady=6)
-
-        # ── Niveau d'énergie ──
-        tk.Label(tb, text="Niveau :", bg=self._TB_BG, fg=self._FG,
-                 font=("Segoe UI", 9)).pack(side="left", padx=(8, 2))
-        self._level_var = tk.StringVar(value=_VIEW_NUCLEI)
-        self._level_combo = ttk.Combobox(
-            tb, textvariable=self._level_var, state="readonly", width=34,
-            font=("Consolas", 9))
-        self._level_combo["values"] = [_VIEW_NUCLEI]
-        self._level_combo.pack(side="left", padx=(0, 12))
-        self._level_combo.bind("<<ComboboxSelected>>", self._on_level_select)
-
-        # ── Afficher nuage ──
-        self._cloud_btn = tk.Button(
-            tb, text="Afficher nuage", bg=self._BTN_BG, fg=self._BTN_FG,
-            activebackground="#585b70", font=("Segoe UI", 9),
-            relief="flat", cursor="hand2", command=self._on_show_cloud)
-        self._cloud_btn.pack(side="left", padx=(0, 8), ipady=2, ipadx=4)
-
-        # ── Potentiel V(r) — slice viewer ──
+        # ── Potential V(r) — slice viewer ──
         self._potential_btn = tk.Button(
-            tb, text="Potentiel V(r)", bg="#f9e2af", fg="#1e1e2e",
+            tb, text="Potential V(r)", bg="#f9e2af", fg="#1e1e2e",
             activebackground="#f5c2e7", font=("Segoe UI", 9, "bold"),
             relief="flat", cursor="hand2", command=self._on_show_potential)
-        self._potential_btn.pack(side="left", padx=(0, 8), ipady=2, ipadx=4)
+        self._potential_btn.pack(side="left", padx=(10, 8), ipady=2, ipadx=4)
+
+        # ── Schrödinger Cloud — electron density from schrodinger.py ──
+        self._cloud_schro_btn = tk.Button(
+            tb, text="Schrödinger Cloud", bg="#cba6f7", fg="#1e1e2e",
+            activebackground="#f5c2e7", font=("Segoe UI", 9, "bold"),
+            relief="flat", cursor="hand2", command=self._on_show_schrodinger_cloud)
+        self._cloud_schro_btn.pack(side="left", padx=(0, 8), ipady=2, ipadx=4)
+
+        # ── Energy Levels — eigenvalues diagram (Pauli: orbitals = ceil(electrons/2)) ──
+        self._energy_levels_btn = tk.Button(
+            tb, text="Energy Levels", bg="#a6e3a1", fg="#1e1e2e",
+            activebackground="#f5c2e7", font=("Segoe UI", 9, "bold"),
+            relief="flat", cursor="hand2", command=self._on_show_energy_levels)
+        self._energy_levels_btn.pack(side="left", padx=(0, 8), ipady=2, ipadx=4)
 
         # ── separator ──
         ttk.Separator(tb, orient="vertical").pack(side="left", fill="y",
                                                   padx=4, pady=6)
 
         # ── Zoom label ──
-        tk.Label(tb, text="Zoom : molette",
+        tk.Label(tb, text="Zoom: mouse wheel",
                  bg=self._TB_BG, fg="#6c7086",
                  font=("Segoe UI", 8, "italic")).pack(side="left", padx=8)
 
@@ -303,7 +257,7 @@ class PubChemChatbot:
         self.ax = self.fig.add_subplot(111, projection="3d",
                                        facecolor=self._BG_CHAT)
         self._style_axes()
-        self.ax.set_title("Aucune molécule chargée",
+        self.ax.set_title("No molecule loaded",
                           color=self._FG, fontsize=11, pad=12)
         self.fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.93)
 
@@ -375,7 +329,7 @@ class PubChemChatbot:
                         ipady=6, padx=(0, 4))
         self.entry.bind("<Return>", self._on_enter)
 
-        tk.Button(entry_frame, text="Envoyer",
+        tk.Button(entry_frame, text="Send",
                   bg=self._ACCENT, fg="#1e1e2e",
                   activebackground="#74c7ec",
                   font=("Segoe UI", 10, "bold"),
@@ -390,8 +344,8 @@ class PubChemChatbot:
         self.chat_text.configure(state="disabled")
         self.chat_text.see("end")
 
-    def _user_say(self, t):   self._append_text(f"Vous :  {t}", "user")
-    def _bot_say(self, t):    self._append_text(f"Bot :  {t}", "bot")
+    def _user_say(self, t):   self._append_text(f"You:  {t}", "user")
+    def _bot_say(self, t):    self._append_text(f"Bot:  {t}", "bot")
     def _bot_error(self, t):  self._append_text(f"Bot :  \u26a0 {t}", "error")
     def _bot_info(self, t):   self._append_text(f"Bot :  \u2139 {t}", "info")
 
@@ -409,29 +363,24 @@ class PubChemChatbot:
 
         if low in ("aide", "help", "?"):
             self._bot_say(
-                "Tapez le nom d'une molécule pour afficher sa géométrie.\n"
+                "Type a molecule name to display its geometry.\n"
                 "  • water, methane, aspirin, caffeine …\n"
-                "  • show me benzene / cherche ethanol\n\n"
-                "Barre d'outils :\n"
-                "  • Modifiez le nombre d'électrons si besoin\n"
-                "  • « Calculer SCF » résout l'équation de Schrödinger\n"
-                "  • Choisissez un niveau dans le menu déroulant\n"
-                "  • « Afficher nuage » dessine les probabilités\n"
-                "  • Zoomez avec la molette\n\n"
-                "Commandes :\n"
-                "  • bohr / angstrom  •  info  •  clear  •  aide")
+                "  • show me benzene / ethanol\n\n"
+                "Toolbar: Potential V(r), Schrödinger Cloud (electron density).\n"
+                "Zoom with mouse wheel.\n\n"
+                "Commands: bohr / angstrom  •  info  •  clear  •  help")
             return
 
         if low in ("bohr", "bohrs"):
             self._display_bohr = True
-            self._bot_info("Unité → Bohr (a\u2080).")
+            self._bot_info("Unit → Bohr (a\u2080).")
             if self._current_mol:
                 self._redraw()
             return
 
         if low in ("angstrom", "angstroms", "\u00e5", "ang"):
             self._display_bohr = False
-            self._bot_info("Unité → \u00c5ngstr\u00f6m (\u00c5).")
+            self._bot_info("Unit → \u00c5ngstr\u00f6m (\u00c5).")
             if self._current_mol:
                 self._redraw()
             return
@@ -440,27 +389,26 @@ class PubChemChatbot:
             if self._current_mol:
                 self._show_molecule_info(self._current_mol)
             else:
-                self._bot_info("Aucune molécule chargée.")
+                self._bot_info("No molecule loaded.")
             return
 
         if low in ("clear", "effacer", "reset"):
             self._current_mol = None
-            self._clear_scf()
             save_nuclei([])  # clear shared state file
             self.ax.clear()
             self._style_axes()
-            self.ax.set_title("Aucune molécule chargée",
+            self.ax.set_title("No molecule loaded",
                               color=self._FG, fontsize=11, pad=12)
             self.canvas_mpl.draw_idle()
-            self._bot_info("Graphique effacé.")
+            self._bot_info("Display cleared.")
             return
 
         # Molecule search
         name = _extract_molecule_name(text)
         if not name:
-            self._bot_error("Je n'ai pas compris. Tapez « aide ».")
+            self._bot_error("I didn't understand. Type \"help\".")
             return
-        self._bot_info(f"Recherche de « {name} » sur PubChem …")
+        self._bot_info(f"Searching for \"{name}\" on PubChem...")
         threading.Thread(target=self._fetch_and_display,
                          args=(name,), daemon=True).start()
 
@@ -472,14 +420,12 @@ class PubChemChatbot:
             self.root.after(0, self._bot_error, str(e))
             return
         except Exception as e:
-            self.root.after(0, self._bot_error, f"Erreur : {e}")
+            self.root.after(0, self._bot_error, f"Error: {e}")
             return
         self.root.after(0, self._on_molecule_received, mol)
 
     def _on_molecule_received(self, mol: dict):
         self._current_mol = mol
-        self._clear_scf()
-        self._electrons_var.set(str(mol["total_electrons"]))
 
         # Sync PubChem geometry → shared nuclei_state.json so that
         # potential_3d, schrodinger_3d, and render_energy_3d all see it.
@@ -498,133 +444,140 @@ class PubChemChatbot:
         unit = "Bohr" if self._display_bohr else "\u00c5"
         factor = 1.0 if self._display_bohr else (1.0 / ANGSTROM_TO_BOHR)
         lines = [
-            f"Molécule : {mol['name']}  (CID {mol['cid']})",
-            f"Formule  : {formula}",
-            f"Atomes   : {len(atoms)}     Liaisons : {len(mol['bonds'])}",
-            f"Électrons (neutre) : {mol['total_electrons']}",
-            "", f"Coordonnées ({unit}) :"]
+            f"Molecule: {mol['name']}  (CID {mol['cid']})",
+            f"Formula : {formula}",
+            f"Atoms   : {len(atoms)}     Bonds: {len(mol['bonds'])}",
+            f"Electrons (neutral): {mol['total_electrons']}",
+            "", f"Coordinates ({unit}):"]
         for i, (sym, (x, y, z)) in enumerate(atoms):
             lines.append(f"  {i+1:3d}  {sym:2s}  "
                          f"({x*factor:8.4f}, {y*factor:8.4f}, {z*factor:8.4f})")
         self._bot_say("\n".join(lines))
 
-    # ═══════════════════  SCF  ══════════════════════════════
-    def _clear_scf(self):
-        self._scf_energies = []
-        self._scf_wavefunctions = []
-        self._scf_grid_info = {}
-        self._scf_occupancies = []
-        self._scf_density = None
-        self._scf_esp = None
-        self._level_var.set(_VIEW_NUCLEI)
-        self._level_combo["values"] = [_VIEW_NUCLEI]
-
-    def _get_num_electrons(self):
-        try:
-            return max(0, int(self._electrons_var.get().strip() or "0"))
-        except ValueError:
-            return 0
-
-    def _on_compute_scf(self):
-        if self._computing:
-            return
+    def _on_show_schrodinger_cloud(self):
+        """Run schrodinger.py pipeline and open cloud visualization (V, |psi_i|^2, combined)."""
         if not self._current_mol:
-            self._bot_error("Chargez d'abord une molécule (tapez son nom).")
+            self._bot_error("Load a molecule first.")
             return
 
-        num_e = self._get_num_electrons()
         nuclei = self._current_mol["atoms"]
+        mol_name = self._current_mol["name"]
+        save_nuclei(nuclei)  # sync PubChem geometry to nuclei_state.json
 
-        self._computing = True
-        self._compute_btn.config(text="Calcul en cours…", state="disabled")
+        self._cloud_schro_btn.config(state="disabled", text="Computing…")
         self._bot_info(
-            f"Lancement SCF : {len(nuclei)} noyaux, {num_e} électrons…\n"
-            "Cela peut prendre quelques secondes.")
+            f"Running Schrödinger solver (50x50x50) for {mol_name}…\n"
+            "This may take 1–2 minutes.")
 
-        threading.Thread(target=self._run_scf,
-                         args=(nuclei, num_e), daemon=True).start()
+        def run():
+            try:
+                data = compute_schrodinger_cloud(nuclei)
+                self.root.after(0, self._on_schrodinger_cloud_done, data, mol_name)
+            except Exception as e:
+                self.root.after(0, self._on_schrodinger_cloud_error, str(e))
 
-    def _run_scf(self, nuclei, num_e):
-        try:
-            result = solve_schrodinger(nuclei, num_electrons=num_e,
-                                       n_grid=16, num_states=7)
-            self.root.after(0, self._on_scf_done, result, num_e)
-        except Exception as e:
-            self.root.after(0, self._on_scf_error, str(e))
+        threading.Thread(target=run, daemon=True).start()
 
-    def _on_scf_error(self, msg):
-        self._computing = False
-        self._compute_btn.config(text="Calculer SCF", state="normal")
-        self._bot_error(f"Erreur SCF : {msg}")
+    def _on_schrodinger_cloud_done(self, data, mol_name):
+        self._cloud_schro_btn.config(state="normal", text="Schrödinger Cloud")
+        if data is None:
+            self._bot_error("Solver returned nothing.")
+            return
+        open_schrodinger_cloud_window(data, parent=self.root, mol_name=mol_name)
+        self._bot_info(f"Schrödinger cloud window opened for {mol_name}.")
 
-    def _on_scf_done(self, result, num_e):
-        self._computing = False
-        self._compute_btn.config(text="Calculer SCF", state="normal")
+    def _on_schrodinger_cloud_error(self, msg):
+        self._cloud_schro_btn.config(state="normal", text="Schrödinger Cloud")
+        self._bot_error(f"Schrödinger error: {msg}")
 
-        energies, wfs, gi, occ, density, esp = result
-        if len(energies) == 0:
-            self._bot_error("Le solveur n'a retourné aucun état propre.")
+    def _on_show_energy_levels(self):
+        """Compute eigenvalues (Pauli: num_orbitals = ceil(electrons/2)) and show energy diagram."""
+        if not self._current_mol:
+            self._bot_error("Load a molecule first.")
             return
 
-        self._scf_energies = energies
-        self._scf_wavefunctions = wfs
-        self._scf_grid_info = gi
-        self._scf_occupancies = occ
-        self._scf_density = density
-        self._scf_esp = esp
+        nuclei = self._current_mol["atoms"]
+        mol_name = self._current_mol["name"]
+        total_electrons = self._current_mol["total_electrons"]
+        save_nuclei(nuclei)
 
-        # Fill energy listbox in chat
-        lines = ["Niveaux d'énergie calculés (Hartree) :"]
-        for i, E in enumerate(energies):
-            ne = occ[i] if i < len(occ) else 0
-            lines.append(f"  E{i} = {E:+.5f} Ha   ({ne} e\u207b)")
-        self._bot_say("\n".join(lines))
+        # Pauli exclusion: 2 electrons per orbital → orbitals = ceil(electrons/2)
+        num_orbitals = max(1, math.ceil(total_electrons / 2))
 
-        # Fill toolbar level combo
-        opts = [_VIEW_NUCLEI]
-        for i, E in enumerate(energies):
-            ne = occ[i] if i < len(occ) else 0
-            opts.append(f"E{i} = {E:+.5f} Ha  ({ne}e\u207b)")
-        if density is not None and num_e > 0:
-            opts.append(_VIEW_DENSITY)
-        if esp is not None and num_e > 0:
-            opts.append(_VIEW_ESP)
-        self._level_combo["values"] = opts
-        self._level_combo.set(_VIEW_NUCLEI)
-
+        self._energy_levels_btn.config(state="disabled", text="Computing…")
         self._bot_info(
-            "Calcul terminé ! Sélectionnez un niveau dans le menu\n"
-            "puis cliquez « Afficher nuage » pour voir les probabilités.")
+            f"Computing {num_orbitals} eigenvalues for {mol_name} "
+            f"({total_electrons} electrons, {num_orbitals} orbitals)…\n"
+            "This may take 1–2 minutes.")
 
-    # ── toolbar: level select ──
-    def _on_level_select(self, event=None):
-        self._redraw()
+        def run():
+            try:
+                data = compute_schrodinger_cloud(nuclei, num_states=num_orbitals)
+                self.root.after(0, self._on_energy_levels_done,
+                                data, mol_name, total_electrons)
+            except Exception as e:
+                self.root.after(0, self._on_energy_levels_error, str(e))
 
-    def _on_show_cloud(self):
-        if not self._scf_wavefunctions:
-            self._bot_error(
-                "Calculez d'abord (« Calculer SCF ») avant d'afficher.")
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_energy_levels_done(self, data, mol_name, total_electrons):
+        self._energy_levels_btn.config(state="normal", text="Energy Levels")
+        if data is None:
+            self._bot_error("Solver returned nothing.")
             return
-        sel = self._level_var.get()
-        if sel == _VIEW_NUCLEI:
-            # Auto-select first orbital
-            vals = self._level_combo["values"]
-            if len(vals) > 1:
-                self._level_combo.set(vals[1])
-        self._redraw()
+        self._open_energy_levels_window(
+            data["eigenvalues"], mol_name, total_electrons)
+        self._bot_info(f"Energy levels window opened for {mol_name}.")
+
+    def _on_energy_levels_error(self, msg):
+        self._energy_levels_btn.config(state="normal", text="Energy Levels")
+        self._bot_error(f"Energy levels error: {msg}")
+
+    def _open_energy_levels_window(self, eigenvalues, mol_name, total_electrons):
+        """Open a new Toplevel with energy level diagram (eigenvalues as horizontal bars).
+        Displays exactly ceil(electrons/2) orbitals — all filled (Pauli exclusion).
+        """
+        win = tk.Toplevel(self.root)
+        win.title(f"Energy Levels — {mol_name}")
+        win.geometry("680x520")
+        win.configure(bg=self._BG)
+
+        n_orb = len(eigenvalues)
+        indices = np.arange(n_orb)
+
+        fig = Figure(figsize=(7, 5), dpi=100, facecolor=self._BG)
+        ax = fig.add_subplot(111, facecolor="#181825")
+        ax.barh(indices, eigenvalues, color="#a6e3a1", edgecolor="#45475a",
+                linewidth=0.8, height=0.6)
+        ax.set_xlabel("Energy (Hartree)", color=self._FG, fontsize=10)
+        ax.set_ylabel("Orbital index", color=self._FG, fontsize=10)
+        ax.set_title(
+            f"{mol_name} — {total_electrons} electrons, "
+            f"{n_orb} orbital{'s' if n_orb != 1 else ''} (Pauli: 2e⁻/orbital)",
+            color=self._FG, fontsize=11)
+        ax.set_yticks(indices)
+        ax.tick_params(colors=self._FG, labelsize=9)
+        ax.set_facecolor("#181825")
+        for spine in ax.spines.values():
+            spine.set_color(self._FG)
+            spine.set_alpha(0.5)
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=8)
 
     # ═══════════════════  POTENTIAL SLICE VIEWER  ═══════════
     def _on_show_potential(self):
         """Open a new window with 2-D slice heatmaps of V(r) for the
         current PubChem molecule (uses potential_on_grid directly)."""
         if not self._current_mol:
-            self._bot_error("Chargez d'abord une molécule.")
+            self._bot_error("Load a molecule first.")
             return
 
         nuclei = self._current_mol["atoms"]
         name = self._current_mol["name"]
 
-        self._bot_info(f"Calcul du potentiel V(r) pour {name}…")
+        self._bot_info(f"Computing potential V(r) for {name}…")
 
         # ── grid ──
         xs = [p[1][0] for p in nuclei]
@@ -655,7 +608,7 @@ class PubChemChatbot:
 
         # ── new Toplevel window ──
         win = tk.Toplevel(self.root)
-        win.title(f"Potentiel V(r) — {name}")
+        win.title(f"Potential V(r) — {name}")
         win.geometry("1300x720")
         win.configure(bg=self._BG)
 
@@ -779,12 +732,12 @@ class PubChemChatbot:
 
         draw()
         self._bot_info(
-            f"Fenêtre du potentiel ouverte pour {name}.\n"
-            "Déplacez les curseurs pour couper à différentes positions.")
+            f"Potential window opened for {name}.\n"
+            "Move the sliders to slice at different positions.")
 
     # ═══════════════════  3D RENDERING  ═════════════════════
     def _redraw(self):
-        """Main drawing routine: nuclei + optional electron cloud."""
+        """Main drawing: nuclei + bonds. Use Schrödinger Cloud for electron density."""
         self.ax.clear()
         self._style_axes()
 
@@ -797,7 +750,7 @@ class PubChemChatbot:
 
         mol = self._current_mol
         if not mol:
-            self.ax.set_title("Aucune molécule chargée",
+            self.ax.set_title("No molecule loaded",
                               color=self._FG, fontsize=11, pad=12)
             self.canvas_mpl.draw_idle()
             return
@@ -806,127 +759,36 @@ class PubChemChatbot:
         bonds = mol["bonds"]
         unit = "Bohr" if self._display_bohr else "\u00c5"
         factor = 1.0 if self._display_bohr else (1.0 / ANGSTROM_TO_BOHR)
-
-        # ── determine what to show ──
-        sel = self._level_var.get()
-        show_orbital = -1   # -1=nuclei, >=0 orbital index
-        show_density = False
-        show_esp = False
-
-        if sel == _VIEW_DENSITY:
-            show_density = True
-        elif sel == _VIEW_ESP:
-            show_esp = True
-        elif sel != _VIEW_NUCLEI and sel:
-            # parse "E2 = ..."  → orbital index 2
-            try:
-                show_orbital = int(sel.split("=")[0].strip()[1:])
-            except (ValueError, IndexError):
-                pass
-
-        # ── title ──
         name = mol["name"]
-        if show_density:
-            self.ax.set_title(f"{name} — Densité électronique",
-                              color=self._FG, fontsize=11, pad=12)
-        elif show_esp:
-            self.ax.set_title(f"{name} — Potentiel électrostatique",
-                              color=self._FG, fontsize=11, pad=12)
-        elif show_orbital >= 0:
-            E = (self._scf_energies[show_orbital]
-                 if show_orbital < len(self._scf_energies) else 0)
-            self.ax.set_title(f"{name} — Orbitale {show_orbital}  "
-                              f"(E={E:+.4f} Ha)",
-                              color=self._FG, fontsize=11, pad=12)
-        else:
-            self.ax.set_title(f"{name}  (CID {mol['cid']})",
-                              color=self._FG, fontsize=11, pad=12)
 
-        # ── atom coordinates ──
+        self.ax.set_title(f"{name}  (CID {mol['cid']})",
+                          color=self._FG, fontsize=11, pad=12)
+
         xs = np.array([x * factor for _, (x, y, z) in atoms])
         ys = np.array([y * factor for _, (x, y, z) in atoms])
         zs = np.array([z * factor for _, (x, y, z) in atoms])
         labels = [s for s, _ in atoms]
         colors = [_ELEMENT_COLORS.get(s, _DEFAULT_COLOR) for s in labels]
 
-        # ── electron cloud dots ──
-        px = py = pz = np.array([])
-        gi = self._scf_grid_info
-        wfs = self._scf_wavefunctions
-
-        if show_orbital >= 0 and show_orbital < len(wfs) and gi:
-            np.random.seed(42)
-            prob = np.abs(wfs[show_orbital]) ** 2
-            px, py, pz = sample_positions_from_probability(
-                prob, gi, num_dots=3000)
-            if not self._display_bohr:
-                px /= ANGSTROM_TO_BOHR
-                py /= ANGSTROM_TO_BOHR
-                pz /= ANGSTROM_TO_BOHR
-            self.ax.scatter(px, py, pz, c="#a6e3a1", s=4, alpha=0.45,
-                            label=f"|\u03c8{show_orbital}|\u00b2")
-
-        elif show_density and self._scf_density is not None and gi:
-            np.random.seed(42)
-            px, py, pz = sample_positions_from_probability(
-                self._scf_density, gi, num_dots=4000)
-            if not self._display_bohr:
-                px /= ANGSTROM_TO_BOHR
-                py /= ANGSTROM_TO_BOHR
-                pz /= ANGSTROM_TO_BOHR
-            self.ax.scatter(px, py, pz, c="#cba6f7", s=4, alpha=0.4,
-                            label="\u03c1(r)")
-
-        elif show_esp and self._scf_esp is not None and gi:
-            np.random.seed(42)
-            px, py, pz = sample_positions_from_probability(
-                self._scf_density, gi, num_dots=4000)
-            phi = get_esp_at_points(px, py, pz, self._scf_esp, gi)
-            if not self._display_bohr:
-                px /= ANGSTROM_TO_BOHR
-                py /= ANGSTROM_TO_BOHR
-                pz /= ANGSTROM_TO_BOHR
-            lo, hi = np.percentile(phi, [5, 95])
-            if lo >= hi:
-                lo, hi = phi.min(), phi.max()
-            if lo >= hi:
-                lo, hi = -1.0, 1.0
-            norm = mcolors.TwoSlopeNorm(
-                vcenter=0.0, vmin=min(lo, -0.01), vmax=max(hi, 0.01))
-            cmap = mcm.RdBu_r
-            self.ax.scatter(px, py, pz, c=cmap(norm(phi)),
-                            s=5, alpha=0.55)
-            sm = mcm.ScalarMappable(norm=norm, cmap=cmap)
-            sm.set_array([])
-            self._colorbar = self.fig.colorbar(
-                sm, ax=self.ax, shrink=0.55, pad=0.08,
-                label="ESP (Ha/e)")
-
-        # ── bonds ──
         for i1, i2, order in bonds:
             lw = 1.0 + 0.8 * (order - 1)
             self.ax.plot([xs[i1], xs[i2]], [ys[i1], ys[i2]],
                          [zs[i1], zs[i2]],
                          color="#585b70", linewidth=lw, alpha=0.6)
 
-        # ── nuclei ──
         for i, (sym, c) in enumerate(zip(labels, colors)):
             self.ax.scatter(xs[i], ys[i], zs[i], c=c, s=160, alpha=0.95,
                             edgecolors="#45475a", linewidths=0.8, zorder=5)
             self.ax.text(xs[i], ys[i], zs[i], f"  {sym}", fontsize=8,
                          color=self._FG, fontweight="bold", zorder=6)
 
-        # ── axis limits ──
-        all_x = np.concatenate([xs, px]) if len(px) else xs
-        all_y = np.concatenate([ys, py]) if len(py) else ys
-        all_z = np.concatenate([zs, pz]) if len(pz) else zs
-        if len(all_x):
-            cx = (all_x.min() + all_x.max()) / 2
-            cy = (all_y.min() + all_y.max()) / 2
-            cz = (all_z.min() + all_z.max()) / 2
-            ext = max(all_x.max() - all_x.min(),
-                      all_y.max() - all_y.min(),
-                      all_z.max() - all_z.min(), 0.5)
+        if len(xs):
+            cx = (xs.min() + xs.max()) / 2
+            cy = (ys.min() + ys.max()) / 2
+            cz = (zs.min() + zs.max()) / 2
+            ext = max(xs.max() - xs.min(),
+                      ys.max() - ys.min(),
+                      zs.max() - zs.min(), 0.5)
             half = ext / 2 + 1.0
             self.ax.set_xlim(cx - half, cx + half)
             self.ax.set_ylim(cy - half, cy + half)
@@ -935,12 +797,11 @@ class PubChemChatbot:
         self.ax.set_xlabel(f"x ({unit})", color=self._FG, fontsize=9)
         self.ax.set_ylabel(f"y ({unit})", color=self._FG, fontsize=9)
         self.ax.set_zlabel(f"z ({unit})", color=self._FG, fontsize=9)
-
         self.ax.dist = self._zoom
         self.canvas_mpl.draw_idle()
 
 
-# ─────────────────────────  Point d'entrée  ─────────────────
+# ─────────────────────────  Entry point  ─────────────────
 def main():
     PubChemChatbot()
 
