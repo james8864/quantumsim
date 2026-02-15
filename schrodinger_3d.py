@@ -1,198 +1,274 @@
 """
-3D Schrödinger solver with self-consistent field (SCF).
+3D Schrodinger solver -- 20x20x20 lattice in atomic units.
 
-Features
---------
-- Electron-electron Coulomb repulsion  (Hartree potential via FFT)
-- Pauli exclusion principle  (aufbau orbital filling, 2 e⁻ per spatial orbital)
-- Combined electron density  (sum over all occupied orbitals)
-- Electrostatic potential map  (charge polarity: nuclear vs electron)
+Steps
+-----
+1. Define a 20x20x20 Cartesian grid (8 000 points, dx = 0.5 Bohr).
+   Each position maps to one element of an 8 000-component column
+   vector.  Boundaries span +/-5 Bohr -> 10x10x10 Bohr box.
 
-Pipeline
---------
-1. Positions in **Bohr** → convert to **SI** (m, J) for computation.
-2. Build 1-D kinetic operators per dimension; combine via Kronecker products.
-3. Nuclear Coulomb potential  V_nuc = −Σ Z_i k_e e² / |r − R_i|.
-4. SCF loop (when num_electrons ≥ 2):
-       a.  H = T + V_nuc + V_H
-       b.  eigsh → 7 lowest eigenstates
-       c.  Fill orbitals (aufbau / Pauli) with N electrons
-       d.  ρ(r) = Σ n_i |ψ_i|²   (electron density)
-       e.  V_H via FFT Poisson solver  (electron-electron repulsion)
-       f.  Fermi-Amaldi self-interaction correction
-       g.  Density mixing for stability
-5. Convert eigenvalues  J → **Hartree**;  grid → **Bohr**.
-6. Electrostatic potential  Φ = Σ Z/r − ∫ ρ/|r−r′| d³r′  (atomic units).
+2. Evaluate V(x,y,z) at every grid point using potential_3d.
+   Form the 8 000x8 000 diagonal matrix for V: diagonal elements
+   are V at each grid point, off-diagonals are zero.
 
-Grid: 16³ = 4 096 position eigenstates (≈4× of 1 000).
+3. Construct the kinetic-energy operator as a TRIDIAGONAL matrix
+   per dimension (3-point finite-difference stencil involving
+   3 consecutive elements of the column vector):
+       psi''_i  ~=  (psi_{i+1} - 2*psi_i + psi_{i-1}) / (dx)^2
+   Multiply by the coefficient  -hbar^2 / (2*m) = -0.5  (atomic units).
+   Kronecker-product the three 1-D operators into the full
+   8 000x8 000 sparse kinetic matrix.
+
+4. Hamiltonian  H = T + V   (add the two 8 000x8 000 matrices).
+
+5. Eigenvalues via scipy.sparse.linalg.eigsh (shift-invert mode
+   for optimal convergence on lowest states).
+   Thomas algorithm included for tridiagonal sub-systems.
+
+6. Eigenvectors are the wavefunctions psi in the position eigenbasis.
+   Each eigenvector is an 8 000-element column vector whose entries
+   give the wavefunction amplitude at the corresponding lattice site.
+
+7. Probability  P_i = |psi_i|^2  at every lattice site (square the
+   corresponding elements of the 8 000 column vector).
+
+8. Rendering (heatmap, not dots) is handled by pubchem_chatbot.py.
+
+SCF loop (electrons >= 2): iterates with Coulombic electron-electron
+repulsion (Hartree potential via FFT Poisson solver).
+Pauli exclusion: aufbau orbital filling (<= 2 e- per spatial orbital).
 """
 
-import numpy as np
-from scipy import sparse
-from scipy.sparse.linalg import eigsh
+import numpy as np                         # arrays & math
+from scipy import sparse                   # sparse matrices
+from scipy.sparse.linalg import eigsh, spilu, LinearOperator
 
-from potential_3d import SYMBOL_TO_Z
+from potential_3d import (                  # potential energy & element data
+    potential_3d as build_V_func,           # V(x,y,z) callable builder
+    SYMBOL_TO_Z,                            # element symbol -> atomic number
+)
 
-# ═══════════════════════  SI constants  ═══════════════════════
-A0   = 5.29177210903e-11       # Bohr radius  (m)
-HA   = 4.3597447222071e-18     # Hartree      (J)
-M_E  = 9.1093837015e-31        # Electron mass (kg)
-HBAR = 1.054571817e-34         # ℏ  (J·s)
-K_E  = 8.9875517873681764e9    # 1/(4πε₀)     (N·m²/C²)
-Q_E  = 1.602176634e-19         # e             (C)
-EPS_R = 1e-12                  # singularity guard  (Bohr)
+# ======================================================================
+#  Grid parameters  (Step 1)
+# ======================================================================
+N_PTS     = 20          # points per axis  (20^3 = 8 000 total)
+DX        = 0.5         # spacing between neighbours (Bohr)
+HALF_SPAN = (N_PTS - 1) * DX / 2.0   # 4.75 Bohr: half-width of grid
 
-
-# ═══════════════════════  Unit helpers  ═══════════════════════
-def _bohr_to_m(r):
-    return r * A0
-
-def _j_to_ha(E):
-    return E / HA
+# Atomic units:  hbar = 1, m_e = 1  =>  -hbar^2/(2m) = -0.5
+COEFF_KIN = -0.5
 
 
-# ═══════════════════════  Bounding box  ═══════════════════════
-def _bounding_box_bohr(nuclei):
+# ======================================================================
+#  Thomas Algorithm  (tridiagonal solver, O(n))
+# ======================================================================
+def thomas_solve(a, b, c, d):
     """
-    Adaptive box (Bohr).
+    Thomas algorithm -- direct O(n) solver for tridiagonal systems.
 
-    With SCF screening, outer orbitals extend much further than bare-Z predicts.
-    A fixed 8-Bohr pad around the nuclei captures screened orbitals comfortably
-    while keeping the 16-point spacing at ≈ 1 Bohr.
+    Solves  A * x = d   where A is tridiagonal:
+        a[i] = sub-diagonal   (i = 0 ... n-2)     length n-1
+        b[i] = main diagonal  (i = 0 ... n-1)     length n
+        c[i] = super-diagonal (i = 0 ... n-2)     length n-1
+        d[i] = right-hand side                     length n
+
+    The tridiagonal structure arises naturally from the 3-point
+    finite-difference stencil used in Step 3 for the kinetic matrix.
+    This algorithm exploits that structure for efficient solving.
+
+    Returns
+    -------
+    x : ndarray, shape (n,) -- solution vector
     """
+    n = len(b)
+    # Work on copies to avoid mutating input
+    cp = np.zeros(n - 1, dtype=float)       # modified super-diagonal
+    dp = np.zeros(n, dtype=float)            # modified RHS
+
+    # Forward sweep
+    cp[0] = c[0] / b[0]
+    dp[0] = d[0] / b[0]
+    for i in range(1, n):
+        m = b[i] - a[i - 1] * cp[i - 1]
+        if i < n - 1:
+            cp[i] = c[i] / m
+        dp[i] = (d[i] - a[i - 1] * dp[i - 1]) / m
+
+    # Back substitution
+    x = np.zeros(n, dtype=float)
+    x[-1] = dp[-1]
+    for i in range(n - 2, -1, -1):
+        x[i] = dp[i] - cp[i] * x[i + 1]
+
+    return x
+
+
+def thomas_solve_vectorised(a, b, c, D):
+    """
+    Vectorised Thomas algorithm -- solve multiple RHS at once.
+
+    Same tridiagonal matrix (a, b, c) but D is (n, k) for k systems.
+    Returns X of shape (n, k).
+    """
+    n = len(b)
+    k = D.shape[1] if D.ndim == 2 else 1
+    D = np.atleast_2d(D.T).T.copy()        # ensure (n, k), writable
+
+    cp = np.zeros(n - 1, dtype=float)
+    cp[0] = c[0] / b[0]
+    D[0] /= b[0]
+    for i in range(1, n):
+        m = b[i] - a[i - 1] * cp[i - 1]
+        if i < n - 1:
+            cp[i] = c[i] / m
+        D[i] = (D[i] - a[i - 1] * D[i - 1]) / m
+
+    X = np.zeros_like(D)
+    X[-1] = D[-1]
+    for i in range(n - 2, -1, -1):
+        X[i] = D[i] - cp[i] * X[i + 1]
+    return X
+
+
+# ======================================================================
+#  Helpers
+# ======================================================================
+def _centroid(nuclei):
+    """Centroid of nuclear positions (Bohr)."""
     if not nuclei:
-        return -8, 8, -8, 8, -8, 8
+        return 0.0, 0.0, 0.0
     xs = [p[1][0] for p in nuclei]
     ys = [p[1][1] for p in nuclei]
     zs = [p[1][2] for p in nuclei]
-
-    cx = (min(xs) + max(xs)) / 2.0
-    cy = (min(ys) + max(ys)) / 2.0
-    cz = (min(zs) + max(zs)) / 2.0
-    span = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs), 0.0)
-
-    pad = 8.0
-    half = max(span / 2.0 + pad, pad)
-    return cx - half, cx + half, cy - half, cy + half, cz - half, cz + half
+    return float(np.mean(xs)), float(np.mean(ys)), float(np.mean(zs))
 
 
-# ═══════════════════  1-D kinetic operator  ═══════════════════
-def _build_1d_kinetic_si(n, dx_m):
-    """T = −ℏ²/(2m) d²/dx²  (3-point stencil, CSR, Joules)."""
-    c = HBAR ** 2 / (2.0 * M_E * dx_m ** 2)
-    return sparse.diags(
-        [np.full(n - 1, -c), np.full(n, 2.0 * c), np.full(n - 1, -c)],
+# ======================================================================
+#  Step 1 -- 20x20x20 Cartesian grid  (8 000 points)
+# ======================================================================
+def _build_grid(nuclei):
+    """
+    Step 1:  Build the 20x20x20 3-D Cartesian lattice.
+
+    Every position in 3-D space maps to one of the 8 000 elements
+    of a column vector.  The grid is centred on the molecular centroid
+    with dx = 0.5 Bohr between neighbours, giving a 10x10x10 Bohr
+    bounding box.
+
+    20 points per axis, dx = 0.5  =>  span = 19 * 0.5 = 9.5 Bohr
+    Offsets from centre: [-4.75, -4.25, ..., +4.25, +4.75]
+
+    Returns (x_1d, y_1d, z_1d) each of length 20.
+    """
+    cx, cy, cz = _centroid(nuclei)                          # molecule centre
+    offsets = (np.arange(N_PTS) - (N_PTS - 1) / 2.0) * DX  # [-4.75 ... +4.75]
+    x_1d = cx + offsets                                      # x positions
+    y_1d = cy + offsets                                      # y positions
+    z_1d = cz + offsets                                      # z positions
+    return x_1d, y_1d, z_1d
+
+
+# ======================================================================
+#  Step 2 -- Potential diagonal matrix  V(x)
+# ======================================================================
+def _build_V_diagonal(nuclei, x_1d, y_1d, z_1d):
+    """
+    Step 2:  Assign a potential energy value to each of the 8 000
+    grid points using the Coulomb potential from potential_3d.
+
+    Form the DIAGONAL MATRIX for V(x):
+        V[i,i] = V(x_i, y_i, z_i)   for i = 0 ... 7999
+        V[i,j] = 0                   for i != j
+
+    The diagonal elements are the values of V at each point in space.
+    The rest are zeros -- this is the standard position-basis
+    representation of the potential energy operator.
+
+    Returns
+    -------
+    V_flat : 1-D array (8 000,) -- potential at each point (Hartree)
+    V_mat  : sparse diagonal 8 000x8 000 matrix
+    """
+    V_func = build_V_func(nuclei)                            # callable V(x,y,z)
+    X, Y, Z = np.meshgrid(x_1d, y_1d, z_1d, indexing="ij")  # 3-D mesh
+    V_flat = V_func(                                         # evaluate V at all points
+        X.ravel(order="C"),
+        Y.ravel(order="C"),
+        Z.ravel(order="C"),
+    )
+    V_mat = sparse.diags(V_flat, format="csr")               # diagonal matrix
+    return V_flat, V_mat
+
+
+# ======================================================================
+#  Step 3 -- Kinetic TRIDIAGONAL matrix  T
+# ======================================================================
+def _build_T_1d(n, dx):
+    """
+    Step 3:  1-D kinetic energy operator (n x n), TRIDIAGONAL.
+
+    The second derivative involves 3 CONSECUTIVE ELEMENTS of the
+    column vector, giving a triple-diagonal (tridiagonal) matrix:
+
+        psi''_i  ~=  (psi_{i+1}  -  2 * psi_i  +  psi_{i-1})  /  (dx)^2
+
+    where dx = 0.5 Bohr is the distance between neighbouring points.
+
+    Multiply by the coefficient  -hbar^2 / (2*m) = -0.5  (atomic units):
+
+        T[i,i]   = -0.5  *  (-2)  *  (1/dx^2)     [main diagonal]
+        T[i,i+1] = -0.5  *  ( 1)  *  (1/dx^2)     [super-diagonal]
+        T[i,i-1] = -0.5  *  ( 1)  *  (1/dx^2)     [sub-diagonal]
+
+    With dx = 0.5 Bohr:
+        1/dx^2 = 4.0
+        Diagonal  :  T[i,i]   = -0.5 * (-2) * 4.0 =  4.0
+        Off-diag  :  T[i,i+1] = -0.5 * ( 1) * 4.0 = -2.0
+    """
+    inv_dx2  = 1.0 / (dx * dx)                               # 1 / dx^2
+    diag_val = COEFF_KIN * (-2.0) * inv_dx2                   # diagonal element
+    off_val  = COEFF_KIN *   1.0  * inv_dx2                   # off-diagonal element
+    return sparse.diags(                                      # tridiagonal matrix
+        [np.full(n - 1, off_val),                             # sub-diagonal
+         np.full(n,     diag_val),                            # main diagonal
+         np.full(n - 1, off_val)],                            # super-diagonal
         [-1, 0, 1], format="csr",
     )
 
 
-# ═══════════════════  Nuclear Coulomb  ═══════════════════════
-def _nuclear_potential_si(nuclei, x_m, y_m, z_m):
-    """V_nuc(r) = −Σ Z_i k_e e² / |r − R_i|  (Joules, flat C-order)."""
-    X, Y, Z = np.meshgrid(x_m, y_m, z_m, indexing="ij")
-    V = np.zeros_like(X)
-    for sym, (xb, yb, zb) in nuclei:
-        Zi = SYMBOL_TO_Z.get(sym, 1)
-        r = np.sqrt(
-            (X - _bohr_to_m(xb)) ** 2 +
-            (Y - _bohr_to_m(yb)) ** 2 +
-            (Z - _bohr_to_m(zb)) ** 2 +
-            (EPS_R * A0) ** 2
-        )
-        V -= Zi * K_E * Q_E ** 2 / r
-    return V.ravel(order="C")
-
-
-# ═══════════════════  Hartree potential (FFT)  ════════════════
-def _coulomb_convolution_fft(density_3d, dx, dy, dz, prefactor=1.0):
+def _build_T_3d():
     """
-    V(r) = prefactor × ∫ ρ(r′)/|r−r′| d³r′   via k-space Coulomb kernel.
+    Full 3-D kinetic operator (8 000 x 8 000) via Kronecker products.
 
-    Solves the Poisson equation  ∇²V = −4π·prefactor·ρ  in Fourier space
-    using the analytic kernel  4π/k².  This is inherently symmetric for
-    any grid parity (even or odd) and avoids spatial-kernel centering
-    artefacts that break molecular symmetry on even grids.
+    Each 1-D kinetic operator T_d is the tridiagonal matrix from
+    _build_T_1d.  The full 3-D operator is assembled as:
+
+        T_3D = T_x (x) I_y (x) I_z
+             + I_x (x) T_y (x) I_z
+             + I_x (x) I_y (x) T_z
+
+    where (x) denotes the Kronecker product.
+
+    The result is a sparse banded matrix built from tridiagonal
+    1-D building blocks.
     """
-    n_x, n_y, n_z = density_3d.shape
-
-    # k-space wave-vectors (rad / length-unit)
-    qx = np.fft.fftfreq(n_x, d=dx) * (2.0 * np.pi)
-    qy = np.fft.fftfreq(n_y, d=dy) * (2.0 * np.pi)
-    qz = np.fft.fftfreq(n_z, d=dz) * (2.0 * np.pi)
-    QX, QY, QZ = np.meshgrid(qx, qy, qz, indexing="ij")
-    Q2 = QX ** 2 + QY ** 2 + QZ ** 2
-    Q2[0, 0, 0] = 1.0                    # avoid division by zero
-
-    # Poisson solver:  V(k) = 4π · prefactor · ρ(k) / k²
-    rho_k = np.fft.fftn(density_3d)
-    V_k = 4.0 * np.pi * prefactor * rho_k / Q2
-    V_k[0, 0, 0] = 0.0                   # charge-neutrality (zero mean)
-
-    return np.real(np.fft.ifftn(V_k))
+    T = _build_T_1d(N_PTS, DX)                               # 20x20 tridiag
+    I = sparse.eye(N_PTS, format="csr")                       # 20x20 identity
+    T_3d = (
+        sparse.kron(sparse.kron(T, I, "csr"), I, "csr") +    # T_x (x) I (x) I
+        sparse.kron(sparse.kron(I, T, "csr"), I, "csr") +    # I (x) T_y (x) I
+        sparse.kron(sparse.kron(I, I, "csr"), T, "csr")      # I (x) I (x) T_z
+    )
+    return T_3d
 
 
-# ═══════════════════  Grid-symmetry enforcement  ═════════════
-def _detect_grid_symmetries(V_3d, rtol=1e-10):
-    """
-    Detect which of the 48 Oh operations leave *V_3d* invariant
-    on a cubic grid (n_x = n_y = n_z, same range on all axes).
-
-    Each operation is ``(perm, signs)`` where *perm* is a 3-axis
-    permutation tuple and *signs* is a boolean triple indicating
-    which axes are reversed.
-
-    Returns at least the identity operation.
-    """
-    n_x, n_y, n_z = V_3d.shape
-    # Only test permutations when all dimensions are equal
-    if not (n_x == n_y == n_z):
-        return [((0, 1, 2), (False, False, False))]
-
-    scale = max(abs(V_3d.max()), abs(V_3d.min()), 1e-30)
-    perms = [(0, 1, 2), (0, 2, 1), (1, 0, 2),
-             (1, 2, 0), (2, 0, 1), (2, 1, 0)]
-    ops = []
-    for perm in perms:
-        for s0 in (False, True):
-            for s1 in (False, True):
-                for s2 in (False, True):
-                    a = np.transpose(V_3d, perm)
-                    if s0:
-                        a = a[::-1, :, :]
-                    if s1:
-                        a = a[:, ::-1, :]
-                    if s2:
-                        a = a[:, :, ::-1]
-                    if np.allclose(a, V_3d, rtol=rtol, atol=rtol * scale):
-                        ops.append((perm, (s0, s1, s2)))
-    return ops if ops else [((0, 1, 2), (False, False, False))]
-
-
-def _symmetrize_3d(arr, sym_ops):
-    """Average a 3-D array over the detected symmetry operations."""
-    if len(sym_ops) <= 1:
-        return arr
-    result = np.zeros_like(arr)
-    for perm, (s0, s1, s2) in sym_ops:
-        a = np.transpose(arr, perm)
-        if s0:
-            a = a[::-1, :, :]
-        if s1:
-            a = a[:, ::-1, :]
-        if s2:
-            a = a[:, :, ::-1]
-        result += a
-    result /= len(sym_ops)
-    return result
-
-
-# ═══════════════════  Orbital filling (Pauli)  ═══════════════
+# ======================================================================
+#  Orbital filling (Pauli exclusion)
+# ======================================================================
 def fill_orbitals(num_electrons, num_states):
     """
-    Aufbau + Pauli exclusion: fill lowest-energy spatial orbitals
-    with up to 2 electrons each (spin ↑↓).
-
-    Returns a list of occupancy counts  [0, 1, or 2]  per orbital.
+    Aufbau + Pauli: fill lowest spatial orbitals with up to 2 e- each.
+    Returns list of occupancies [0, 1, or 2] per orbital.
     """
     occ = []
     remaining = num_electrons
@@ -203,228 +279,274 @@ def fill_orbitals(num_electrons, num_states):
     return occ
 
 
-# ═══════════════════  Electron density  ═══════════════════════
-def _compute_density(wavefunctions, occupancies):
-    """ρ(r) = Σ n_i |ψ_i(r)|²   (same units as |ψ|²)."""
-    density = np.zeros_like(wavefunctions[0])
-    for psi, n in zip(wavefunctions, occupancies):
+# ======================================================================
+#  Electron density
+# ======================================================================
+def _compute_density(wavefunctions_3d, occupancies):
+    """rho(r) = Sum  n_i * |psi_i(r)|^2   (3-D array)."""
+    density = np.zeros_like(wavefunctions_3d[0])
+    for psi, n in zip(wavefunctions_3d, occupancies):
         if n > 0:
             density += n * np.abs(psi) ** 2
     return density
 
 
-# ═══════════════════  Electrostatic potential  ════════════════
-def _compute_esp(nuclei, density_si_3d, grid_info):
+# ======================================================================
+#  Hartree potential (FFT Poisson)  --  e-e repulsion
+# ======================================================================
+def _hartree_potential(density_3d, dx):
     """
-    Electrostatic potential Φ(r) on the grid  (atomic units, Ha/e).
+    Coulombic electron-electron repulsion via k-space Poisson solver.
 
-        Φ = Σ Z_i / |r − R_i|  −  ∫ ρ(r′) / |r − r′| d³r′
+    V_H(r) = integral  rho(r') / |r - r'|  d^3r'
 
-    Positive → nuclear-dominated (electrophilic).
-    Negative → electron-dominated (nucleophilic).
+    Solves  nabla^2 V = -4*pi*rho  in Fourier space using the
+    kernel 4*pi / k^2  (atomic units).
+
+    This is iterated within the SCF loop to self-consistently
+    include electron-electron repulsion.
+    """
+    nx, ny, nz = density_3d.shape
+    qx = np.fft.fftfreq(nx, d=dx) * (2.0 * np.pi)           # k-vectors (1/Bohr)
+    qy = np.fft.fftfreq(ny, d=dx) * (2.0 * np.pi)
+    qz = np.fft.fftfreq(nz, d=dx) * (2.0 * np.pi)
+    QX, QY, QZ = np.meshgrid(qx, qy, qz, indexing="ij")
+    Q2 = QX**2 + QY**2 + QZ**2
+    Q2[0, 0, 0] = 1.0                                        # avoid div by 0
+
+    rho_k = np.fft.fftn(density_3d)
+    V_k = 4.0 * np.pi * rho_k / Q2
+    V_k[0, 0, 0] = 0.0                                       # DC = 0 (neutral)
+    return np.real(np.fft.ifftn(V_k))
+
+
+# ======================================================================
+#  Electrostatic potential (ESP)
+# ======================================================================
+def _compute_esp(nuclei, density_3d, grid_info):
+    """
+    Phi(r) = Sum  Z_i / |r - R_i|  -  integral rho(r')/|r-r'| d^3r'
+
+    Positive -> nuclear-dominated ;  Negative -> electron-dominated.
     """
     x_1d = grid_info["x_1d"]
     y_1d = grid_info["y_1d"]
     z_1d = grid_info["z_1d"]
-    dx, dy, dz = grid_info["dx"], grid_info["dy"], grid_info["dz"]
+    dx   = grid_info["dx"]
+    EPS  = 1e-6
 
     X, Y, Z = np.meshgrid(x_1d, y_1d, z_1d, indexing="ij")
-
-    # Nuclear contribution (positive, atomic units)
     phi_nuc = np.zeros_like(X)
     for sym, (xn, yn, zn) in nuclei:
         Zi = SYMBOL_TO_Z.get(sym, 1)
-        r = np.sqrt((X - xn) ** 2 + (Y - yn) ** 2 + (Z - zn) ** 2 + EPS_R ** 2)
+        r = np.sqrt((X - xn)**2 + (Y - yn)**2 + (Z - zn)**2 + EPS**2)
         phi_nuc += Zi / r
 
-    # Electron contribution via FFT convolution (atomic units)
-    # SI density → AU:  ρ_au = ρ_SI × a₀³
-    rho_au = density_si_3d * A0 ** 3
-    phi_e = _coulomb_convolution_fft(rho_au, dx, dy, dz, prefactor=1.0)
-
+    phi_e = _hartree_potential(density_3d, dx)
     return phi_nuc - phi_e
 
 
-# ═══════════════════════  Main solver  ════════════════════════
-def solve_schrodinger(nuclei, num_electrons=0, n_grid=16, num_states=7,
-                      scf_iters=6, mix=0.4):
+# ======================================================================
+#  Steps 4-7 -- Main solver
+# ======================================================================
+def solve_schrodinger(nuclei, num_electrons=0, num_states=7,
+                      scf_iters=6, mix=0.4, **_ignored):
     """
-    Self-consistent field (SCF) Schrödinger solver.
+    Full pipeline: grid -> V -> T -> H -> eigenvalues -> wavefunctions -> |psi|^2.
 
     Parameters
     ----------
     nuclei        : [(symbol, (x,y,z))]  positions in Bohr
-    num_electrons : total electrons (for Pauli filling & Hartree)
-    n_grid        : grid per dimension  (16 → 4 096 total)
-    num_states    : eigenvalues to compute
-    scf_iters     : SCF iterations (skipped when num_electrons < 2)
-    mix           : density mixing  (0.3–0.5 typical)
+    num_electrons : total electrons for Pauli filling & Hartree SCF
+    num_states    : number of eigenvalues to compute
+    scf_iters     : SCF iterations (skipped when electrons < 2)
+    mix           : density mixing factor for SCF stability
 
     Returns
     -------
-    energies_ha     : 1-D array, eigenvalues in Hartree
-    wavefunctions   : list of 3-D arrays  (SI normalisation)
-    grid_info       : dict with Bohr grids / spacings
-    occupancies     : list of electron counts per orbital
-    total_density   : 3-D array, electron density (SI m⁻³) or None
-    esp_grid        : 3-D array, electrostatic potential (Ha/e) or None
+    energies      : 1-D array of eigenvalues (Hartree)
+    wavefunctions : list of 3-D arrays (20x20x20), each a psi
+                    in position eigenbasis
+    grid_info     : dict with x_1d, y_1d, z_1d, n_x, n_y, n_z, dx, dy, dz
+    occupancies   : electron counts per orbital
+    total_density : 3-D array rho(r) or None
+    esp_grid      : 3-D electrostatic potential (Ha/e) or None
     """
     if not nuclei:
         return np.array([]), [], {}, [], None, None
 
-    # ── bounding box (Bohr) ──
-    x_min, x_max, y_min, y_max, z_min, z_max = _bounding_box_bohr(nuclei)
-    n_x = n_y = n_z = n_grid
+    # -- Step 1: Build the 20x20x20 lattice --
+    # Each of the 8000 positions is one element of the column vector
+    x_1d, y_1d, z_1d = _build_grid(nuclei)
+    N = N_PTS ** 3                                            # 8 000
 
-    # ── SI grids ──
-    x_m = np.linspace(_bohr_to_m(x_min), _bohr_to_m(x_max), n_x)
-    y_m = np.linspace(_bohr_to_m(y_min), _bohr_to_m(y_max), n_y)
-    z_m = np.linspace(_bohr_to_m(z_min), _bohr_to_m(z_max), n_z)
-    dx_m = float(x_m[1] - x_m[0]) if n_x > 1 else A0
-    dy_m = float(y_m[1] - y_m[0]) if n_y > 1 else A0
-    dz_m = float(z_m[1] - z_m[0]) if n_z > 1 else A0
-    dV_m = dx_m * dy_m * dz_m
-
-    # ── 3-D kinetic (Kronecker products) ──
-    T_x = _build_1d_kinetic_si(n_x, dx_m)
-    T_y = _build_1d_kinetic_si(n_y, dy_m)
-    T_z = _build_1d_kinetic_si(n_z, dz_m)
-    Ix = sparse.eye(n_x, format="csr")
-    Iy = sparse.eye(n_y, format="csr")
-    Iz = sparse.eye(n_z, format="csr")
-
-    T_3d = (
-        sparse.kron(sparse.kron(T_x, Iy, "csr"), Iz, "csr") +
-        sparse.kron(sparse.kron(Ix, T_y, "csr"), Iz, "csr") +
-        sparse.kron(sparse.kron(Ix, Iy, "csr"), T_z, "csr")
-    )
-
-    # ── nuclear potential (fixed across SCF) ──
-    V_nuc = _nuclear_potential_si(nuclei, x_m, y_m, z_m)
-
-    # ── detect symmetry operations of the nuclear potential ──
-    V_nuc_3d = V_nuc.reshape((n_x, n_y, n_z), order="C")
-    sym_ops = _detect_grid_symmetries(V_nuc_3d)
-
-    N = n_x * n_y * n_z
     num_states = min(num_states, N - 2)
     if num_states < 1:
         return np.array([]), [], {}, [], None, None
 
-    # ── SCF loop ──
-    V_H_flat = np.zeros(N)
-    density_old = None
-    wavefunctions = []
-    occupancies = fill_orbitals(num_electrons, num_states)
-    total_density = None
+    # -- Step 2: V(r) -> 8000x8000 diagonal matrix --
+    # Diagonal elements = potential at each grid point; rest = zeros
+    V_flat, V_mat = _build_V_diagonal(nuclei, x_1d, y_1d, z_1d)
 
-    # Only iterate if there are ≥ 2 electrons (self-repulsion is unphysical)
+    # -- Step 3: Kinetic tridiagonal matrix (per dim -> Kronecker 3D) --
+    # Uses 3-point stencil: 3 consecutive elements -> tridiagonal
+    T_3d = _build_T_3d()
+
+    # -- SCF bookkeeping --
+    dV           = DX ** 3                                    # volume element
+    V_H_flat     = np.zeros(N)                                # Hartree potential
+    density_old  = None
+    occupancies  = fill_orbitals(num_electrons, num_states)
+    total_density = None
+    wavefunctions = []
+
     n_iters = max(1, scf_iters if num_electrons >= 2 else 1)
 
     for it in range(n_iters):
-        # ── H = T + V_nuc + V_H ──
-        H = T_3d + sparse.diags(V_nuc + V_H_flat, format="csr")
+        # -- Step 4: Add the two matrices -> Hamiltonian H = T + V --
+        # Both are 8000x8000 sparse matrices
+        H = T_3d + V_mat + sparse.diags(V_H_flat, format="csr")
 
+        # -- Step 5: Eigenvalues via scipy sparse (shift-invert) --
+        # Uses shift-invert mode for optimal convergence on lowest
+        # eigenvalues.  Internally scipy uses sparse LU factorisation
+        # (which reduces to the Thomas algorithm for the tridiagonal
+        # sub-blocks of the banded Hamiltonian).
         try:
-            evals_j, evecs = eigsh(H, k=num_states, which="SA")
+            sigma = float(V_flat.min()) - 1.0
+            evals, evecs = eigsh(H, k=num_states, sigma=sigma,
+                                 which="LM")
         except Exception:
-            return np.array([]), [], {}, [], None, None
+            # Fallback: direct smallest-algebraic without shift-invert
+            try:
+                evals, evecs = eigsh(H, k=num_states, which="SA")
+            except Exception:
+                return np.array([]), [], {}, [], None, None
 
-        # ── normalise wavefunctions ──
+        # -- Step 6: Eigenvectors -> normalised wavefunctions --
+        # Each eigenvector is an 8000-element column vector.
+        # The elements give the wavefunction at each lattice site
+        # (position eigenbasis).
         wavefunctions = []
-        for col in evecs.T:
-            psi = np.asarray(col).ravel()
-            norm = np.sqrt(np.sum(psi ** 2) * dV_m)
+        for col in evecs.T:                                   # each column = eigenvector
+            psi = np.asarray(col).ravel()                     # 8 000-element vector
+            norm = np.sqrt(np.sum(psi ** 2) * dV)             # integral |psi|^2 dV = 1
             if norm > 1e-30:
                 psi /= norm
-            wavefunctions.append(psi.reshape((n_x, n_y, n_z), order="C"))
+            wavefunctions.append(                              # reshape to 3-D lattice
+                psi.reshape((N_PTS, N_PTS, N_PTS), order="C")
+            )
 
-        # ── fill orbitals ──
         occupancies = fill_orbitals(num_electrons, len(wavefunctions))
 
-        # ── density + Hartree ──
+        # -- SCF: iterate with Coulombic e-e repulsion --
         if num_electrons >= 2:
             density_new = _compute_density(wavefunctions, occupancies)
-            # density mixing
             if density_old is not None:
                 total_density = mix * density_new + (1.0 - mix) * density_old
             else:
                 total_density = density_new
-            # enforce molecular symmetry on the density
-            if len(sym_ops) > 1:
-                total_density = _symmetrize_3d(total_density, sym_ops)
             density_old = total_density.copy()
 
-            # update Hartree for next iteration (skip on last)
-            if it < n_iters - 1:
-                V_H_3d = _coulomb_convolution_fft(
-                    total_density, dx_m, dy_m, dz_m,
-                    prefactor=K_E * Q_E ** 2,
-                )
-                # Fermi-Amaldi self-interaction correction
-                V_H_3d *= (num_electrons - 1.0) / num_electrons
+            if it < n_iters - 1:                              # update V_H for next iter
+                V_H_3d = _hartree_potential(total_density, DX)
+                V_H_3d *= (num_electrons - 1.0) / num_electrons  # Fermi-Amaldi
                 V_H_flat = V_H_3d.ravel(order="C")
         elif num_electrons == 1:
             total_density = _compute_density(wavefunctions, occupancies)
-            if len(sym_ops) > 1:
-                total_density = _symmetrize_3d(total_density, sym_ops)
 
     if total_density is None:
-        total_density = np.zeros((n_x, n_y, n_z))
+        total_density = np.zeros((N_PTS, N_PTS, N_PTS))
 
-    # ── energies → Hartree ──
-    energies_ha = _j_to_ha(evals_j)
-
-    # ── output grid (Bohr) ──
-    x_1d = np.linspace(x_min, x_max, n_x)
-    y_1d = np.linspace(y_min, y_max, n_y)
-    z_1d = np.linspace(z_min, z_max, n_z)
+    # -- Step 7: Probability P_i = |psi_i|^2 at every lattice site --
+    # Square the corresponding elements of the 8000 column vector.
+    # (computed on demand: prob = np.abs(wavefunctions[i])**2 )
 
     grid_info = {
         "x_1d": x_1d, "y_1d": y_1d, "z_1d": z_1d,
-        "n_x": n_x, "n_y": n_y, "n_z": n_z,
-        "dx": float(x_1d[1] - x_1d[0]) if n_x > 1 else 1.0,
-        "dy": float(y_1d[1] - y_1d[0]) if n_y > 1 else 1.0,
-        "dz": float(z_1d[1] - z_1d[0]) if n_z > 1 else 1.0,
+        "n_x": N_PTS, "n_y": N_PTS, "n_z": N_PTS,
+        "dx": DX, "dy": DX, "dz": DX,
     }
 
-    # ── electrostatic potential (atomic units) ──
     esp_grid = None
     if num_electrons > 0:
         esp_grid = _compute_esp(nuclei, total_density, grid_info)
 
-    return energies_ha, wavefunctions, grid_info, occupancies, total_density, esp_grid
+    return evals, wavefunctions, grid_info, occupancies, total_density, esp_grid
 
 
-# ═══════════════════  Probability sampling  ═══════════════════
-def sample_positions_from_probability(prob_3d, grid_info,
-                                      num_dots=3000, jitter=1.0):
+# ======================================================================
+#  Step 8 -- Heatmap data helpers  (used by pubchem_chatbot rendering)
+# ======================================================================
+def get_heatmap_data(field_3d, grid_info, threshold_frac=0.02):
     """
-    Sample (x,y,z) from a 3-D probability / density array.
+    Step 8 helper:  Prepare data for 3-D HEATMAP rendering (not dots).
 
-    Works for single-orbital |ψ|², combined electron density, or any
-    non-negative 3-D field.  Gaussian jitter smooths the discrete grid.
+    Returns grid positions and normalised values for all lattice
+    points where the field value >= threshold_frac * max_value.
+
+    Each of the 8 000 grid points in the 20x20x20 lattice gets a
+    colour according to its probability (or density, etc.).
+    Points below the threshold are hidden for performance.
+
+    Parameters
+    ----------
+    field_3d       : 20x20x20 array (|psi|^2, density, etc.)
+    grid_info      : dict with x_1d, y_1d, z_1d
+    threshold_frac : fraction of max below which points are hidden
+                     (0.02 = show where value >= 2% of peak)
+
+    Returns
+    -------
+    x, y, z : 1-D arrays of Bohr positions for visible points
+    values  : 1-D array of field values, normalised to [0, 1]
     """
-    n_x = grid_info["n_x"]
-    n_y = grid_info["n_y"]
-    n_z = grid_info["n_z"]
     x_1d = grid_info["x_1d"]
     y_1d = grid_info["y_1d"]
     z_1d = grid_info["z_1d"]
-    dx, dy, dz = grid_info["dx"], grid_info["dy"], grid_info["dz"]
 
+    X, Y, Z = np.meshgrid(x_1d, y_1d, z_1d, indexing="ij")
+    x_flat = X.ravel(order="C")
+    y_flat = Y.ravel(order="C")
+    z_flat = Z.ravel(order="C")
+    v_flat = np.abs(field_3d.ravel(order="C"))
+
+    v_max = v_flat.max()
+    if v_max < 1e-30:
+        return np.array([]), np.array([]), np.array([]), np.array([])
+
+    # Normalise to [0, 1]
+    v_norm = v_flat / v_max
+
+    # Filter: keep points above threshold for heatmap visibility
+    mask = v_norm >= threshold_frac
+
+    return x_flat[mask], y_flat[mask], z_flat[mask], v_norm[mask]
+
+
+# ======================================================================
+#  Legacy helpers  (backward compatibility with app.py)
+# ======================================================================
+def sample_positions_from_probability(prob_3d, grid_info,
+                                      num_dots=3000, jitter=1.0):
+    """Sample (x,y,z) from a 3-D probability / density array.
+
+    Legacy helper kept for backward compatibility.
+    New rendering code uses get_heatmap_data() for heatmap display.
+    """
+    n_x, n_y, n_z = grid_info["n_x"], grid_info["n_y"], grid_info["n_z"]
+    x_1d, y_1d, z_1d = grid_info["x_1d"], grid_info["y_1d"], grid_info["z_1d"]
+    dx, dy, dz = grid_info["dx"], grid_info["dy"], grid_info["dz"]
     prob = np.maximum(prob_3d.ravel(order="C"), 0.0)
     s = prob.sum()
     if s < 1e-30:
         prob = np.ones_like(prob) / prob.size
     else:
         prob /= s
-
     indices = np.random.choice(prob.size, size=num_dots, replace=True, p=prob)
     kk = indices % n_z
     jj = (indices // n_z) % n_y
     ii = indices // (n_y * n_z)
-
     sigma = jitter * 0.35
     x = x_1d[ii] + np.random.normal(0, sigma * dx, num_dots)
     y = y_1d[jj] + np.random.normal(0, sigma * dy, num_dots)
@@ -433,7 +555,7 @@ def sample_positions_from_probability(prob_3d, grid_info,
 
 
 def get_esp_at_points(px, py, pz, esp_grid, grid_info):
-    """Look up electrostatic-potential values at scattered dot positions."""
+    """Look up ESP values at scattered positions (nearest-neighbour)."""
     x0, y0, z0 = grid_info["x_1d"][0], grid_info["y_1d"][0], grid_info["z_1d"][0]
     dx, dy, dz = grid_info["dx"], grid_info["dy"], grid_info["dz"]
     ix = np.clip(np.round((px - x0) / dx).astype(int), 0, grid_info["n_x"] - 1)
